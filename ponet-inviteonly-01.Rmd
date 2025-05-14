@@ -1,0 +1,853 @@
+---
+title: "PoNet: Invite Only"
+subtitle: >
+  Descriptive statistics, logistic regression models, and ALAAM data prep for the Journal of Criminal Justice article:  
+  *“Invite Only: The Prevalence of Subgroups within a Police Department”*  
+  ([DOI](https://doi.org/10.1016/j.jcrimjus.2024.102347))
+author: "Police Networks Project"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+This report documents the analytic workflow used in "Invite Only," including data preparation, descriptive summaries, logistic regression models, and data export for ALAAM estimation.
+
+---
+
+
+Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(tidyverse)
+library(kableExtra)
+library(corrtable) # for correlation matrix
+library(furniture) # for descriptive tables
+library(car)       # vif
+```
+
+---
+
+# Import and Clean Data
+
+This section imports survey and operations data from two waves and merges them to create a complete officer-level dataset for analysis.
+
+
+```{r}
+# import survey data wave 2 (only wave and dept w/ invite only Qs)
+df22 <- read.csv("data/ponet_xpd_2022.csv") 
+df21 <- read_csv("data/ponet_xpd_2021.csv")
+```
+
+Exclude 10 respondents who didn't respond to grp_invite question
+```{r}
+df22 <- df22 %>% filter(!is.na(grp_invite))
+```
+
+Import attributes from wave 1 to wave 2
+```{r}
+# select attributes and gen nyears
+df21 <- df21 %>% 
+  mutate(nyears = 2021 - acad_yr) %>%
+  select(uid, male, race, hisp, nyears, nops)
+df22 <- df22 %>%
+  mutate(nyears = 2022 - acad_yr)
+
+# join df21 and df22
+df22 <- left_join(df22, df21, by = c("uid"))
+
+# replace missing values in df22 w/ values from df21
+df22 <- df22 %>%
+  mutate(male = ifelse(is.na(male.x), male.y, male.x),
+         race = ifelse(is.na(race.x), race.y, race.x),
+         hisp = ifelse(is.na(hisp.x), hisp.y, hisp.x),
+         nyears = ifelse(is.na(nyears.x), nyears.y, nyears.x),
+         nops = ifelse(!is.na(nops.x), nops.x + nops.y, nops.y),
+         nops = ifelse(is.na(nops.y) & !is.na(nops.x), nops.x, nops)) %>% # for officers who had already taken the survey in wave 1 they were invited to only report complaints since last in-service, therefore added their w1 and w2 ops scores together. If they only reported nops in wave 2 and not in wave 1, still kept their wave 2 score
+  select(-c(ends_with(c(".x", ".y"))))
+```
+
+Generate ops variables and attach to primary dataset
+```{r}
+# read in ops data
+ops22 <- read.csv("data/ponet_xpd_ops.csv") # ops data
+
+# gen number ops incidents variable
+ops22 <- ops22 %>%
+  group_by(uid) %>%
+  mutate(nops2 = n_distinct(iid))
+
+# collapse to officer-level selecting only relevant vars for analysis
+ops22 <- ops22 %>%
+  select(uid, nops2) %>%
+  group_by(uid) %>%
+  slice(1) %>%
+  ungroup()
+
+## Merge survey data and ops data
+df22 <- left_join(df22, ops22, by = c("uid"))
+
+# Use nops2 (ops reports) unless officer missing ops reports, then use survey data
+df22 <- df22 %>%
+  mutate(nops2 = ifelse(is.na(nops2), nops, nops2))
+```
+
+---
+
+# Generate Attributes
+
+Derived variables are created to capture officer characteristics, race, rank, proactive behavior, and street assignment across waves.
+
+
+```{r}
+# rename/recode values in race var
+df22 <- df22 %>%
+  mutate(race = 
+         ifelse(race == 2 | race == 3 | race == 4, "Other",
+         ifelse(race == 1, "Black",
+         ifelse(race == 5, "White", NA))))
+
+# merge race other w/ race black (low cell counts for 'other' category btwn invite/not invite)
+df22 <- df22 %>%
+  mutate(race = ifelse(race =="Other", "Black", race))
+
+# gen binary race = white variable
+df22 <- df22 %>%
+  mutate(white = ifelse(race == "White", 1, 0))
+
+# rename/code values in rank var
+df22 <- df22 %>%
+  mutate(rank = 
+         ifelse(rank == "Lieutenant" |
+                rank == "Captain" | 
+                rank == "Major" |
+                rank == "Deputy Chief", "Lieutenant and above",
+         ifelse(rank == "Recruit" |
+                rank == "Police Officer" | 
+                rank == "Senior Police Officer", "Police Officer",
+                rank)))
+
+# gen binary police officer variable
+df22 <- df22 %>%
+  mutate(officer = ifelse(rank == "Police Officer", 1, 0))
+
+# gen gun/taser fire + draw
+df22 <- df22 %>%
+  mutate(gun = gun_draw + gun_fire,
+         taser = taser_draw + taser_fire)
+
+# if street1 is missing replace w/ dept_street22
+df22 <- df22 %>%
+  mutate(street1 = ifelse(is.na(street1), dept_street22, street1))
+
+# if proactive1 is missing replace w/ dept_pro22
+df22 <- df22 %>%
+  mutate(proactive1 = ifelse(is.na(proactive1), dept_pro22, proactive1))
+
+# Gen street-level variable
+# replace NA w/ 88 so ifelse statement doesn't ignore NAs
+df22 <- df22 %>% 
+  ungroup() %>%
+  mutate(street1x    = ifelse(is.na(street1), 88, street1),
+         street2x    = ifelse(is.na(street2), 88, street2),
+         proactive1x = ifelse(is.na(proactive1), 88, proactive1),
+         proactive2x = ifelse(is.na(proactive2), 88, proactive2),
+         rank        = ifelse(is.na(rank), 88, rank)
+         )
+
+# gen officer street-level (and not white shirt) 
+df22 <- df22 %>%
+  mutate(street_asst = ifelse(street1x == 1 | street2x == 1, 1, 0),
+         street_rank = ifelse(rank == "Captain" | rank == "Major" | rank == "Deputy Chief", 0, 1),
+         street_asst = ifelse(street1x == 88 & street2x == 88, NA, street_asst),
+         street_rank = ifelse(rank == 88, NA, street_rank),
+         street = ifelse(street_asst == 1 & street_rank == 1, 1, 0))
+
+# gen street-level based on past two years of assts
+df22 <- df22 %>%
+  mutate(street1 = ifelse(street1x == 1 | street2x == 1, 1, 0),
+         street1 = ifelse(street1x == 88 & street2x == 88, NA, street1))
+
+# gen proactive based on past two years of assts
+df22 <- df22 %>%
+  mutate(proactive1 = ifelse(proactive1x == 1 | proactive2x == 1, 1, 0),
+         proactive1 = ifelse(proactive1x == 88 & proactive2x == 88, NA, proactive1))
+```
+
+---
+
+# Construct Network Graphs
+Create directed `igraph` objects for mentor and friend nominations, removing self-loops and retaining isolates.
+
+
+Generate igraph objects - mentor network
+```{r}
+# gen wave 2 edgelists
+el22 <- df22 %>% 
+  gather(key = "key", value = "alter", 
+         mtr01:mtr03) 
+```
+
+Remove self-loops/duplicates and retain isolates
+```{r}
+# replace 55555, 88888, and 99999 w/ NA 
+el22 <- el22 %>%
+  mutate(alter = ifelse(alter == "88888", NA, alter),
+         alter = ifelse(alter == "99999", NA, alter),
+         alter = ifelse(alter == "55555", NA, alter))
+
+# gen indicator of out-degree to retain isolates - wave 1
+el22 <- el22 %>% group_by(uid) %>%
+  mutate(dego = n_distinct(alter, na.rm = T))
+
+# replace alter with uid for instances where degree == 0
+el22 <- el22 %>%
+  mutate(alter = replace(alter, dego == 0, uid))
+
+# remove rows where alter = NA
+el22 <- el22 %>% drop_na(alter)
+
+# remove duplicates - instances where ego nominated same alter more than once same wave
+el22 <- el22 %>%
+  group_by(uid, alter) %>%
+  slice(1) %>%
+  ungroup()
+```
+
+Filter edgelist to only include alters who responded to the survey in CURRENT WAVE (for some egos, none of their alters responded to the survey)
+```{r}
+# in el - identify if nomination responded to survey
+el22$ego_survey <- el22$uid   %in% df22$uid  
+el22$alt_survey <- el22$alter %in% df22$uid  
+
+# calculate dego not taking into account alt_survey == FALSE (e.g. instances where none of ego's alters responded to the survey)
+el22 <- el22 %>%
+  group_by(uid, wave) %>%
+  mutate(count_false = sum(alt_survey == "FALSE")) %>%
+  ungroup()
+
+# identify if none of ego's alters responded to the survey - to retain isolates
+el22 <- el22 %>%
+  mutate(alter_noresponse = ifelse(dego == count_false, 1, 0))
+
+# if none of ego's alters responded to the survey - replace alter w/ ego's uid
+el22 <- el22 %>%
+  mutate(alter = ifelse(alter_noresponse == 1, uid, alter))
+
+# in el - only retain nominations who responded to survey
+el22 <- el22 %>% 
+  filter(ego_survey == "TRUE") %>%
+  filter(alt_survey == "TRUE" | alter_noresponse == 1)
+
+# remove duplicates - instances where none of ego's alters responded to survey, and each alter replaced with uid
+el22 <- el22 %>%
+  group_by(uid, alter) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(uid, alter)
+```
+
+Convert to igraph object
+```{r}
+# convert to igraph object
+g_m <- igraph::graph_from_data_frame(el22, vertices = df22, directed = TRUE)
+```
+
+Generate igraph objects - friend network
+
+Gen edgelists
+```{r}
+# gen wave 2 edgelists
+el22 <- df22 %>% 
+  gather(key = "key", value = "alter", 
+         frd01:frd10) 
+```
+
+Remove self-loops/duplicates and retain isolates
+```{r}
+# replace 55555, 88888, and 99999 w/ NA 
+el22 <- el22 %>%
+  mutate(alter = ifelse(alter == "88888", NA, alter),
+         alter = ifelse(alter == "99999", NA, alter),
+         alter = ifelse(alter == "55555", NA, alter))
+
+# gen indicator of out-degree to retain isolates - wave 1
+el22 <- el22 %>% group_by(uid) %>%
+  mutate(dego = n_distinct(alter, na.rm = T))
+
+# replace alter with uid for instances where degree == 0
+el22 <- el22 %>%
+  mutate(alter = replace(alter, dego == 0, uid))
+
+# remove rows where alter = NA
+el22 <- el22 %>% drop_na(alter)
+
+# remove duplicates - instances where ego nominated same alter more than once same wave
+el22 <- el22 %>%
+  group_by(uid, alter) %>%
+  slice(1) %>%
+  ungroup()
+```
+
+Filter edgelist to only include alters who responded to the survey in CURRENT WAVE (for some egos, none of their alters responded to the survey)
+```{r}
+# in el - identify if nomination responded to survey
+el22$ego_survey <- el22$uid   %in% df22$uid  
+el22$alt_survey <- el22$alter %in% df22$uid  
+
+# calculate dego not taking into account alt_survey == FALSE (e.g. instances where none of ego's alters responded to the survey)
+el22 <- el22 %>%
+  group_by(uid, wave) %>%
+  mutate(count_false = sum(alt_survey == "FALSE")) %>%
+  ungroup()
+
+# identify if none of ego's alters responded to the survey - to retain isolates
+el22 <- el22 %>%
+  mutate(alter_noresponse = ifelse(dego == count_false, 1, 0))
+
+# if none of ego's alters responded to the survey - replace alter w/ ego's uid
+el22 <- el22 %>%
+  mutate(alter = ifelse(alter_noresponse == 1, uid, alter))
+
+# in el - only retain nominations who responded to survey
+el22 <- el22 %>% 
+  filter(ego_survey == "TRUE") %>%
+  filter(alt_survey == "TRUE" | alter_noresponse == 1)
+
+# remove duplicates - instances where none of ego's alters responded to survey, and each alter replaced with uid
+el22 <- el22 %>%
+  group_by(uid, alter) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(uid, alter)
+```
+
+Convert to igraph object
+```{r}
+# convert to igraph object
+g <- igraph::graph_from_data_frame(el22, vertices = df22, directed = TRUE)
+
+g <- igraph::simplify(g, remove.loops = TRUE)
+```
+
+---
+
+# Network Statistics
+Generate descriptive statistics from network objects for use in models and tables.
+
+
+Calculate ego density
+```{r}
+egonet_list <- make_ego_graph(g)
+
+dat <- data.frame(
+  uid = names(V(g)),
+  ego_density = lapply(egonet_list, graph.density) %>% unlist()
+)
+
+# convert uid to character for left_join
+df22$uid <- as.character(df22$uid)
+
+# attach results to dataframe
+df22 <- left_join(df22, dat, by = c("uid"))
+```
+
+Calculate number of direct ties that were also invited to join a group/clique
+```{r}
+# gen nties invite, and mean ties invite
+V(g)$nties_invite = sapply(ego(g,1,V(g),mode = 'all',mindist = 1), function(v) sum(V(g)[v]$grp_invite))
+V(g)$meanties_invite = sapply(ego(g,1,V(g),mode = 'all',mindist = 1), function(v) mean(V(g)[v]$grp_invite))
+
+# convert vertex attributes to dataframe
+d_vert_attr <- igraph::as_data_frame(g, what = "vertices")
+
+# select relevant vars
+d_vert_attr <- d_vert_attr %>% select(name, nties_invite, meanties_invite)
+
+# attach results to master dataframe
+df22 <- left_join(df22, d_vert_attr, by = c("uid" = "name"))
+
+# clean meanties_invite
+df22 <- df22 %>%
+  mutate(meanties_invite = ifelse(is.na(meanties_invite) & nties_invite == 0, 0, meanties_invite))
+```
+
+Calculate network statistics
+```{r}
+df22$degi <- igraph::degree(g, mode = "in")
+df22$dego <- igraph::degree(g, mode = "out")
+df22$degt <- igraph::degree(g, mode = "total")
+df22$cc   <- transitivity(g, type = c("local"))
+df22$bet  <- igraph::betweenness(g, normalized = TRUE)
+df22$eig  <- eigen_centrality(g)$vector
+
+# replace NA value of CC w/ 0 (has < 2 neighbors)
+df22 <- df22 %>%
+  mutate(cc = ifelse(is.na(cc), 0, cc))
+```
+
+Calculate network statistics used in ALAAM
+```{r}
+# convert to directed matrix 
+adj2 <- as.matrix(igraph::as_adjacency_matrix(g)) 
+
+# convert diagonal matrix to zero (remove self-loops)
+diag(adj2) <- 0
+
+# sort rows and columns - adjacency matrix
+adj2 <- adj2[sort(rownames(adj2)), sort(colnames(adj2))]
+
+# sort rows - attributes
+ df22 <- df22 %>%  arrange(uid)
+
+# gen nrows
+n2 <- nrow(adj2)
+
+# calculate network stats used in alaam
+out.degree     <-matrix( rowSums(adj2), n2, 1)               # number of ties sent
+in.degree      <- matrix( colSums(adj2) , n2, 1 )            # number of ties received
+rec.ties       <-  matrix( rowSums(adj2 * t(adj2) ), n2 , 1) # number of ties that are mutual
+in.two.star    <- matrix( choose(in.degree,2),n2,1)          # in-stars reflecting dispersion in popularity
+out.two.star   <- matrix( choose(out.degree,2),n2,1)         # out-stars reflecting dispersion in activity
+mix.two.star   <- in.degree*out.degree - rec.ties            # correlation between indegree and outdegree
+in.three.star  <- matrix( choose(in.degree,3),n2,1)          # further measure of in-degree heterogeneity
+out.three.star <- matrix( choose(out.degree,3),n2,1)         # further measure of out-degree heterogeneity
+triangles      <- rowSums( adj2* (adj2 %*% t(adj2) )  )      # embedded in transitive triads
+
+# confirm network data and attribute data in the same order
+invisible(df22$uid==rownames(network::as.sociomatrix(adj2)))
+uid <- select(df22, uid)
+
+# create df of net stats
+covs2 <- cbind(uid,
+              out.degree, 
+              in.degree,
+              rec.ties,
+              in.two.star,
+              out.two.star,
+              mix.two.star,
+              in.three.star,
+              out.three.star,
+              triangles)
+
+covs2 <- as.data.frame(covs2)
+df22 <- left_join(df22, covs2, by = c("uid"))
+
+```
+
+
+Gen network vars for descriptives table - mentor
+
+Calculate ego density
+```{r}
+egonet_list <- make_ego_graph(g_m)
+
+dat <- data.frame(
+  uid = names(V(g_m)),
+  ego_density_m = lapply(egonet_list, graph.density) %>% unlist()
+)
+
+# convert uid to character for left_join
+df22$uid <- as.character(df22$uid)
+
+# attach results to dataframe
+df22 <- left_join(df22, dat, by = c("uid"))
+```
+
+Calculate number of direct ties that were also invited to join a group/clique
+```{r}
+# get a list of neighbours, for each node
+g_ngh <- igraph::neighborhood(g_m, mindist = 1) 
+
+# write a function that gets the sum of friends that were invited                      
+get.sum <- function(x){
+  sum(V(g_m)$grp_invite[x])
+}
+
+# apply the function, add result to the graph
+V(g_m)$nties_invite_m <- sapply(g_ngh, get.sum)
+
+# get data into dataframe, if necessary
+d_vert_attr <- igraph::as_data_frame(g_m, what = "vertices")
+
+# select relevant vars
+d_vert_attr <- d_vert_attr %>% select(name, nties_invite_m)
+
+# attach results to dataframe
+df22 <- left_join(df22, d_vert_attr, by = c("uid" = "name"))
+```
+
+Calculate network statistics
+```{r}
+df22$degi_m <- igraph::degree(g_m, mode = "in")
+df22$dego_m <- igraph::degree(g_m, mode = "out")
+df22$degt_m <- igraph::degree(g_m, mode = "total")
+df22$cc_m   <- transitivity(g_m, type = c("local"))
+df22$bet_m  <- igraph::betweenness(g_m, normalized = TRUE)
+df22$eig_m  <- eigen_centrality(g_m)$vector
+
+# replace NA value of CC w/ 0 (has < 2 neighbors)
+df22 <- df22 %>%
+  mutate(cc = ifelse(is.na(cc), 0, cc))
+
+# gen ever nominated as a mentor == 1
+df22 <- df22 %>%
+  mutate(mentor = ifelse(degi_m > 0, 1, 0))
+```
+
+# Descriptive Tables
+Present key statistics by group invite status and gender.
+
+```{r}
+# filter to only include officers who reported being invited
+invite <- df22 %>%
+  filter(grp_invite == 1)
+
+# convert vars to type factor
+invite <- invite %>%
+  dplyr::mutate(invite, across(c(male, white, hisp, officer, street1, proactive1, grp_invitef, grp_invitel, grp_online), as.factor))
+
+# generate descriptive table
+furniture::table1(invite, grp_invitef, grp_invitel,
+                  grp_online,
+                  grp_resp, grp_ment, grp_priv, grp_belong, na.rm = FALSE) %>%
+  kableExtra::kable()
+
+# generate descriptive table and export to word
+invite_desc <- furniture::table1(invite, grp_invitef, grp_invitel,
+                  grp_online,
+                  grp_resp, grp_ment, grp_priv, grp_belong, na.rm = FALSE) %>%
+  as.data.frame()
+
+write.csv(invite_desc, "ponet_invite_grps.csv")
+
+# generate descriptive table and export to word - comparing sex
+invite_desc_sex <- furniture::table1(invite, grp_invitef, grp_invitel,
+                  grp_online,
+                  grp_resp, grp_ment, grp_priv, grp_belong, male, white, hisp, officer, street1, proactive1, nyears, gun, taser, force, nops, po_obey, po_do, po_trust, po_help, po_contact, po_valued, po_values_pub, degt, dego, degi, bet, cc, eig, triangles, ego_density, nties_invite,
+           degt_m, dego_m, degi_m, bet_m, cc_m, eig_m, ego_density_m, nties_invite_m, splitby = ~male, total = TRUE, test = TRUE, na.rm = FALSE) %>%
+  as.data.frame()
+
+write.csv(invite_desc_sex, "ponet_invite_grps_sex.csv")
+```
+
+Generate tables for likert scales
+```{r}
+# Define the Likert scale labels
+likert_labels <- c("Strongly Disagree", "Disagree", "Neutral", "Agree", "Strongly Agree")
+
+# Function to create a frequency table for a Likert scale variable
+create_likert_table <- function(variable, var_name) {
+  table <- table(factor(variable, levels = 0:4, labels = likert_labels))
+  prop_table <- prop.table(table) * 100
+  return(data.frame(
+    Variable = var_name,
+    Response = names(table),
+    Frequency = as.numeric(table),
+    Percentage = round(as.numeric(prop_table), 2)
+  ))
+}
+
+# Create frequency tables for each variable
+table_var1 <- create_likert_table(invite$grp_resp, 'resp')
+table_var2 <- create_likert_table(invite$grp_ment, 'ment')
+table_var3 <- create_likert_table(invite$grp_priv, 'priv')
+table_var4 <- create_likert_table(invite$grp_belong, 'belong')
+
+# Combine the tables into one
+likert_table <- bind_rows(table_var1, table_var2, table_var3, table_var4)
+
+# Pivot the table to a wide format for better readability
+likert_table_wide <- likert_table %>%
+  pivot_wider(names_from = Response, values_from = c(Frequency, Percentage), values_fill = 0) %>%
+  arrange(Variable)
+
+# Print the table
+kable(likert_table_wide, caption = "Likert Scale Frequency Table for Three Variables")
+```
+
+Generate officer-level descriptives table
+```{r}
+# convert vars to type factor
+invite1 <- df22 %>%
+  dplyr::mutate(df22, across(c(grp_invite, male, white, hisp, officer, street1, proactive1, mentor), as.factor))
+
+# generate descriptive table
+furniture::table1(invite1, male, white, hisp, officer, street1, proactive1, nyears, gun, taser, force, nops2, degt, dego, degi, rec.ties, triangles, nties_invite, splitby = ~grp_invite, total = TRUE, na.rm = FALSE, test = TRUE) %>%
+  kableExtra::kable()
+
+# generate descriptive table and export to word
+invite1_desc <- furniture::table1(invite1, male, white, hisp, officer, street1, proactive1, nyears, gun, taser, force, nops2, degt, dego, degi, rec.ties, triangles, nties_invite,  splitby = ~grp_invite, total = TRUE, na.rm = FALSE, test = TRUE, digits = 2) %>%
+  as.data.frame()
+
+t.test(df22$eig ~ df22$grp_invite, var.equal = FALSE)
+
+write.csv(invite1_desc, "ponet_invite_descriptives.csv")
+```
+
+Correlation matrix
+```{r}
+# correlation matrix (one option)
+library(corrtable)
+#https://paulvanderlaken.com/2020/07/28/publication-ready-correlation-matrix-significance-r/#save_correlation_matrix
+  
+# select relevant vars for correlation
+vars <- df22 %>% select(c(grp_invite, male, white, hisp, officer, street1, proactive1, nyears, gun, taser, force, nops2, degt, dego, degi,  rec.ties, in.two.star, out.two.star, triangles, eig, bet, nties_invite))
+
+
+
+cors <-  correlation_matrix(vars, digits = 3, use = "lower", replace_diagonal = TRUE)
+
+# export as csv file
+ write.csv(cors, "ponet_invite_correlation.csv")
+```
+
+---
+
+# Logistic Regression Models with Multiple Imputation
+Estimate models predicting group invitation using imputed datasets.
+
+```{r}
+# load libraries
+library(mice)   # impute missing data
+library(broom)  # pool results
+
+# Convert categorical vars to factor vectors
+df22$grp_invite <- factor(df22$grp_invite, labels = c("No", "Yes"))
+df22 <- df22 %>%
+  dplyr::mutate(df22, across(c(male, white, hisp, officer, street1, proactive1), as.factor))
+
+# select relevant vectors for analysis
+df <- df22 %>% select(grp_invite, male, white, hisp, officer, street1, proactive1, nyears, gun, taser, nops, force, degi, dego, eig, triangles, nties_invite)
+
+# Perform multiple imputations
+imputed_data <- mice(df, m = 20, method = "pmm", seed = 500)
+
+# Fit the logistic regression model to each imputed dataset
+fit1 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                               nyears + gun + taser + force + nops2, 
+                               data = df22, family = binomial))
+
+fit2 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                               nyears + gun + taser + force + nops2 + 
+                                 dego +
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+fit3 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                                 nyears + gun + taser + force + nops2 + 
+                                 degi + 
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+fit4 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                                 nyears + gun + taser + force + nops2 + 
+                                 triangles + 
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+fit5 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                                 nyears + gun + taser + force + nops2 + 
+                                 dego + degi +
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+fit6 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                                 nyears + gun + taser + force + nops2 + 
+                                 dego + triangles + 
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+fit7 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                                 nyears + gun + taser + force + nops2 + 
+                                 degi + triangles +
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+fit8 <- with(imputed_data, glm(grp_invite ~ male + white + hisp + officer + street1 + proactive1 + 
+                                 nyears + gun + taser + force + nops2 + 
+                                 dego + degi + triangles + 
+                                 nties_invite, 
+                               data = df22, family = binomial))
+
+# Pool the results to obtain final estimates
+options(scipen = 999)
+pooled_results1 <- pool(fit1)
+summary_pooled1 <- summary(pooled_results1)
+
+pooled_results2 <- pool(fit2)
+summary_pooled2 <- summary(pooled_results2)
+
+pooled_results3 <- pool(fit3)
+summary_pooled3 <- summary(pooled_results3)
+
+pooled_results4 <- pool(fit4)
+summary_pooled4 <- summary(pooled_results4)
+
+pooled_results5 <- pool(fit5)
+summary_pooled5 <- summary(pooled_results5)
+
+pooled_results6 <- pool(fit6)
+summary_pooled6 <- summary(pooled_results6)
+
+pooled_results7 <- pool(fit7)
+summary_pooled7 <- summary(pooled_results7)
+
+pooled_results8 <- pool(fit8)
+summary_pooled8 <- summary(pooled_results8)
+
+# Calculate odds ratios
+summary_pooled1$odds_ratio <- exp(summary_pooled1$estimate)
+summary_pooled2$odds_ratio <- exp(summary_pooled2$estimate)
+summary_pooled3$odds_ratio <- exp(summary_pooled3$estimate)
+summary_pooled4$odds_ratio <- exp(summary_pooled4$estimate)
+summary_pooled5$odds_ratio <- exp(summary_pooled5$estimate)
+summary_pooled6$odds_ratio <- exp(summary_pooled6$estimate)
+summary_pooled7$odds_ratio <- exp(summary_pooled7$estimate)
+summary_pooled8$odds_ratio <- exp(summary_pooled8$estimate)
+
+# Calculate confidence intervals for the odds ratios
+summary_pooled1$conf.low <- exp(summary_pooled1$estimate - 1.96 * summary_pooled1$std.error)
+summary_pooled1$conf.high <- exp(summary_pooled1$estimate + 1.96 * summary_pooled1$std.error)
+
+summary_pooled2$conf.low <- exp(summary_pooled2$estimate - 1.96 * summary_pooled2$std.error)
+summary_pooled2$conf.high <- exp(summary_pooled2$estimate + 1.96 * summary_pooled2$std.error)
+
+summary_pooled3$conf.low <- exp(summary_pooled3$estimate - 1.96 * summary_pooled3$std.error)
+summary_pooled3$conf.high <- exp(summary_pooled3$estimate + 1.96 * summary_pooled3$std.error)
+
+summary_pooled4$conf.low <- exp(summary_pooled4$estimate - 1.96 * summary_pooled4$std.error)
+summary_pooled4$conf.high <- exp(summary_pooled4$estimate + 1.96 * summary_pooled4$std.error)
+
+summary_pooled5$conf.low <- exp(summary_pooled5$estimate - 1.96 * summary_pooled5$std.error)
+summary_pooled5$conf.high <- exp(summary_pooled5$estimate + 1.96 * summary_pooled5$std.error)
+
+summary_pooled6$conf.low <- exp(summary_pooled6$estimate - 1.96 * summary_pooled6$std.error)
+summary_pooled6$conf.high <- exp(summary_pooled6$estimate + 1.96 * summary_pooled6$std.error)
+
+summary_pooled7$conf.low <- exp(summary_pooled7$estimate - 1.96 * summary_pooled7$std.error)
+summary_pooled7$conf.high <- exp(summary_pooled7$estimate + 1.96 * summary_pooled7$std.error)
+
+summary_pooled8$conf.low <- exp(summary_pooled8$estimate - 1.96 * summary_pooled8$std.error)
+summary_pooled8$conf.high <- exp(summary_pooled8$estimate + 1.96 * summary_pooled8$std.error)
+
+# Select relevant columns
+results1 <- summary_pooled1[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results2 <- summary_pooled2[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results3 <- summary_pooled3[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results4 <- summary_pooled4[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results5 <- summary_pooled5[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results6 <- summary_pooled6[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results7 <- summary_pooled7[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+results8 <- summary_pooled8[, c("term", "odds_ratio", "conf.low", "conf.high", "p.value")]
+
+# Export the results to a CSV file
+write.csv(results1, file = "ponet_invite_logistic_mice1.csv", row.names = FALSE)
+write.csv(results2, file = "ponet_invite_logistic_mice2.csv", row.names = FALSE)
+write.csv(results3, file = "ponet_invite_logistic_mice3.csv", row.names = FALSE)
+write.csv(results4, file = "ponet_invite_logistic_mice4.csv", row.names = FALSE)
+write.csv(results5, file = "ponet_invite_logistic_mice5.csv", row.names = FALSE)
+write.csv(results6, file = "ponet_invite_logistic_mice6.csv", row.names = FALSE)
+write.csv(results7, file = "ponet_invite_logistic_mice7.csv", row.names = FALSE)
+write.csv(results8, file = "ponet_invite_logistic_mice8.csv", row.names = FALSE)
+
+# Tidy the pooled results for a cleaner output
+#tidy(pooled_results1)
+#tidy(pooled_results2)
+#tidy(pooled_results3)
+
+```
+
+Logistic regression - calculate w/ pooled data to perform VIF calculations
+```{r}
+# Combine the imputed datasets into a single dataset for VIF calculation
+complete_data <- complete(imputed_data, action = "long", include = FALSE)
+
+# Fit logistic regression model on the combined dataset
+combined_model <- glm(grp_invite ~ male + white + hisp + officer + proactive1 + nyears + gun + taser + force + nops + dego + degi + triangles + nties_invite, data = complete_data, family = binomial)
+
+# Calculate VIF
+vif_values <- vif(combined_model)
+
+# Print the VIF values
+print(vif_values)
+```
+
+
+Calculate Moran's I
+```{r}
+library(ape)
+
+# Extract the binary attribute
+grp_invite <- V(g)$grp_invite
+
+# Get the adjacency matrix
+adj_matrix <- as.matrix(as_adjacency_matrix(g))
+
+# Calculate Moran's I
+moran_i <- Moran.I(grp_invite, adj_matrix, na.rm = T)
+
+# Print the results
+print(moran_i)
+
+```
+
+---
+
+# Export for ALAAM
+Export cleaned network matrix and attributes for ALAAM analysis.
+
+Convert edgelists to matrices and export as csv files for ALAAM
+Network only includes individuals who responded to group invite question
+
+Export files for ALAAM
+```{r}
+# convert to adjacency matrix 
+net <- as.matrix(igraph::as_adjacency_matrix(g)) 
+
+# convert diagonal matrix to zero (remove self-loops)
+diag(net) <- 0
+
+# sort rows and columns - adjacency matrix
+net <- net[sort(rownames(net)), sort(colnames(net))]
+
+# sort rows - attributes
+df22 <- df22 %>%  arrange(uid)
+
+# confirm network data and attribute data in the same order
+invisible(df22$uid==rownames(network::as.sociomatrix(net)))
+
+# export binary outcome grp_invite
+outcome <- select(df22, grp_invite)
+outcome <- outcome %>% mutate(grp_invite = ifelse(grp_invite == "No", 0, 1))
+
+# male
+attributes <- select(df22, male, white, hisp, officer, street1, proactive1, nyears, gun, taser, force, nops2, eig)
+
+# export as csv file
+write.csv(outcome, "ALAAM/outcome.csv")
+write.csv(attributes, "ALAAM/attributes.csv")
+
+# save as R data file
+saveRDS(outcome, file = "ALAAM/outcome.rds")
+saveRDS(attributes, file = "ALAAM/attributes.rds")
+saveRDS(net, "ALAAM/net.rds")
+```
+
+
+
+
+
+

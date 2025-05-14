@@ -1,0 +1,294 @@
+---
+title: "PoNet: Invite Only – ALAAM Estimation"
+subtitle: >
+  This file estimates ALAAMs as reported in the Journal of Criminal Justice article:  
+  *“Invite Only: The Prevalence of Subgroups within a Police Department”*  
+  ([DOI](https://doi.org/10.1016/j.jcrimjus.2024.102347))
+author: "Police Networks Project"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+This report formats the input data and runs ALAAMs to assess network differences across officers invited/not invited to subgroups within a police network. Due to computational intensity, `eval=FALSE` prevents execution when knitting.
+
+---
+
+# Import Data
+Data is produced via `ponet_inviteonly-01.Rmd`. Files must be pre-saved in `ALAAM/`.
+
+Import data
+```{r}
+setwd("C:/Users/ouell/Desktop/PONET/project") # set to your working directory
+
+readRDS(file = "ALAAM/net.rds")
+readRDS(file = "ALAAM/outcome.rds")
+readRDS(file = "ALAAM/attributes.rds")
+```
+
+# Format Network and Outcome
+Convert the network to matrix form and extract the binary outcome. 
+```{r}
+n2 <- nrow(net2)
+adj2 <- as.matrix(net2) # convert from data frame to matrix
+invite <- outcome
+```
+
+# Load ALAAM Routines
+Requires `MultivarALAAMalt.R` from [GitHub ALAAM repository](https://github.com/johankoskinen/ALAAM).
+
+```{r}
+source("MultivarALAAMalt.R")
+```
+
+---
+
+# Generate Network Structural Covariates
+Calculates 1- to 3-star structures, reciprocity, and transitivity.
+```{r structur}
+out.degree     <- matrix( rowSums(adj2), n2, 1)             # number of ties sent
+in.degree      <- matrix( colSums(adj2) , n2, 1 )           # number of ties received
+rec.ties       <- matrix( rowSums(adj2 * t(adj2) ), n2 , 1) # number of ties that are mutual
+in.two.star    <- matrix( choose(in.degree,2),n2,1)         # in-stars reflecting dispersion in popularity
+out.two.star   <- matrix( choose(out.degree,2),n2,1)        # out-stars reflecting dispersion in activity
+mix.two.star   <- in.degree*out.degree - rec.ties           # correlation between indegree and outdegree
+in.three.star  <- matrix( choose(in.degree,3),n2,1)         # further measure of in-degree heterogeneity
+out.three.star <- matrix( choose(out.degree,3),n2,1)        # further measure of out-degree heterogeneity
+triangles      <- rowSums( adj2* (adj2 %*% t(adj2) )  )     # embedded in transitive triads
+```
+
+---
+
+# Format Attributes and Combine with Network Stats
+Ensure numeric formatting, handle missingness, and bind all covariates.
+```{r formatcovs}
+# convert to numeric vars
+attributes$male       <- as.numeric(as.character(attributes$male))
+attributes$white      <- as.numeric(as.character(attributes$white))
+attributes$hisp       <- as.numeric(as.character(attributes$hisp))
+attributes$officer    <- as.numeric(as.character(attributes$officer))
+attributes$street1    <- as.numeric(as.character(attributes$street1))
+attributes$proactive1 <- as.numeric(attributes$proactive1)
+attributes$nyears     <- as.numeric(attributes$nyears)
+attributes$gun        <- as.numeric(attributes$gun)
+attributes$taser      <- as.numeric(attributes$taser)
+attributes$force      <- as.numeric(attributes$force)
+attributes$nops2      <- as.numeric(attributes$nops2)
+
+# Function to calculate the mode
+get_mode <- function(x) {
+  uniq_vals <- unique(x)
+  uniq_vals[which.max(tabulate(match(x, uniq_vals)))]
+}
+
+# replace missing w/ mode
+attributes <- attributes %>%
+  mutate(across(everything(), ~replace_na(., get_mode(.))))
+
+covs2 <- cbind(attributes[,1], 
+               attributes[,2], 
+               attributes[,3], 
+               attributes[,4], 
+               attributes[,5], 
+               attributes[,6], 
+               attributes[,7], 
+               attributes[,8], 
+               attributes[,9], 
+               attributes[,10], 
+               attributes[,11], 
+               attributes[,12], 
+               out.degree, 
+               in.degree,
+               rec.ties,
+               in.two.star,
+               out.two.star,
+               mix.two.star,
+               in.three.star,
+               out.three.star,
+               triangles)
+
+# set colnames
+colnames(covs2) <- c("Male",
+                     "White", 
+                     "Hisp",
+                     "Officer",
+                    "Street",
+                    "Proactive",
+                    "Nyears",
+                    "Gun",
+                    "Taser",
+                    "Force",
+                    "Nops",
+                    "Eig",
+                    "outdegree",
+                    "indegree",
+                    "reciprocation" ,
+                    "instar",
+                    "outstar",
+                    "twopath",
+                    "in3star",
+                    "out3star",
+                    "transitive")
+
+
+head(covs2)
+```
+
+---
+
+# Estimate ALAAMs
+Run base and contagion models using the ALAAM routines. (Evaluation disabled by default.)
+
+
+Set outcome as y_vector
+```{r}
+y_vector <- invite$grp_invite
+```
+
+Run prelimary Markov model that does not include a contagion effect
+```{r firstrun}
+res.0 <- BayesALAAM(y = y_vector,            # dependent variable
+                    ADJ = adj2,              # network
+                    covariates = out.degree, # covariates
+                    directed = TRUE,         # directed network
+                    Iterations = 1000,       # number of iterations
+                    saveFreq = 100,          # print and save frequency
+                    contagion = 'none')      # type of contagion
+```
+
+```{r tracefirstrun}
+plot(ts(res.0$Theta[,1:10]))
+```
+
+Run a model that that includes a contagion effect (invite) - model 1
+```{r}
+res.1 <- BayesALAAM(y = y_vector,                                                  # dependent variable
+                    ADJ = adj2,                                                    # network
+                    covariates = covs2[,c(1,2,3,4,5,6,7,8,9,10,11,13,14,15,21)],   # covariates
+                    directed = TRUE,                                               # directed network
+                    Iterations = 20000,                                            # number of iterations
+                    saveFreq = 200,                                                # print and save frequency
+                    contagion ='simple')                                           # contagion ='simple' 
+
+
+res.1.table <- write.res.table(burnin=10000,                             # should be set sufficiently high
+                datamat=res.1$Thetas,                                    # the result from BayesALAAM
+                thin=1,                                                  # should be set so that SACF is sufficiently low, impt for CI
+                tabname=NULL)                                            # the name appended to the table that is saved
+
+sim.1 <- get.gof.distribution(NumIterations=20000,                       # number of vectors to draw
+	                              res=res.1,                               # the ALAAM estimation object contains model/results
+	                              burnin=1000,                             # no. iterations discarded from GOF distribution
+	                              thinning = 20,                           # no. iterations between sample points
+	                              contagion = 'simple')                    # should be the same as for model fitted
+	
+gof.table(obs.stats=	sim.1$stats,                                       # observed statistics included  not fitted statistics
+          sim.stats=	sim.1$Sav.gof,                                     # simulated goodness-of-fit statistics
+          name.vec=	sim.1$gof.stats.names,                               # names of statistics calculated
+          tabname='ALAAMGofalt',                                         # name of file saved
+          pvalues=TRUE,                                                  # posterior predictive p-values
+          save.tab ='csv',                                               # save a csv file or a LaTex file
+          directed=TRUE,
+          Imp.gof = sim.1$Imp.gof)                                       # NB: we have missing values so we need to add these
+```
+
+# Assess Convergence and Posterior Summaries
+Trace plots, effective sample sizes, and summary tables.
+
+Check how well the MCMC mixes do a traceplot of the poster
+```{r trace}
+plot(ts(res.1$Thetas))
+```
+
+```{r propvar}
+Propsigma2 <- cov(res.1$Thetas)
+```
+
+---
+
+# Re-estimate with Optimized Proposal Covariance
+Use `Propsigma2` to improve mixing.
+
+```{r}
+res.2 <- BayesALAAM(y = y_vector,                                                     # dependent variable
+                    ADJ = adj2,                                                       # network
+                    covariates = covs2[,c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,21)],   # covariates
+                    directed = TRUE,                                                  # directed network
+                    Iterations = 20000,                                               # number of iterations
+                    saveFreq = 200,                                                   # print and save frequency
+                    PropSigma = Propsigma2,
+                    contagion ='simple')                                              # contagion ='simple' 
+
+
+res.2.table <- write.res.table(burnin=10000,                             # should be set sufficiently high
+                datamat=res.2$Thetas,                                    # the result from BayesALAAM
+                thin=1,                                                  # should be set so that SACF is sufficiently low, impt for CI
+                tabname=NULL)                                            # the name appended to the table that is saved
+
+sim.2 <- get.gof.distribution(NumIterations=20000,                       # number of vectors to draw
+	                              res=res.2,                               # the ALAAM estimation object that contains model and results
+	                              burnin=1000,                             # no. iterations discarded from GOF distribution
+	                              thinning = 20,                           # no. iterations between sample points
+	                              contagion = 'simple')                    # should be the same as for model fitted
+	
+gof.table(obs.stats=	sim.2$stats,                                       # observed statistics included  not fitted statistics
+          sim.stats=	sim.2$Sav.gof,                                     # simulated goodness-of-fit statistics
+          name.vec=	sim.2$gof.stats.names,                               # names of statistics calculated
+          tabname='ALAAMGofalt',                                         # name of file saved
+          pvalues=TRUE,                                                  # posterior predictive p-values
+          save.tab ='csv',                                               # save a csv file or a LaTex file
+          directed=TRUE,
+          Imp.gof = sim.2$Imp.gof)                                       # NB: we have missing values so we need to add these
+```
+
+---
+
+# Check Performance and Posteriors
+Use ``r 'plotPost'`` to simultaneously plot the posterior distributions, the (serial) autocorrelations, and the trace plots
+```{r thirdrunplot}
+plotPost(ALAAMresult=res.2,figname='simplecontagion')
+```
+
+Produce a results table
+```{r restabb2}
+write.res.table(burnin=1, # should be set sufficiently high
+                datamat=res.2$Thetas, # the result from BayesALAAM
+                thin=1, # should be set so that SACF is sufficiently low, important for CI
+                tabname=NULL) # the name appended to the table that is saved
+```
+
+
+Calculate likelihoods
+```{r indeplike}
+logit.est <- glm(res.2$ALAAMobj$y~res.1$ALAAMobj$covariates, family = binomial(link = "logit"))
+p <- dim(res.1$Thetas)[2]
+thetaRef <- matrix(0,p,1)
+thetaRef[1] <- summary(logit.est)$coef[1,1]
+thetaRef[3:p] <- summary(logit.est)$coef[2:(p-1),1]
+
+```
+
+Evaluate the deviance across posterior draws
+```{r postedev1}
+relLike <- aitkinPostDev(ALAAMresult=res.2,# the ALAAM results object
+                           burnin=20, # number of parameter draws to be discarded - should eliminate dependence on initial conditions
+                           thinning=15, # model selection is more sensitive to serial autocorrelation than point estimates and standard deviations
+                           numYsamps=100, # number of simulated vectors to base Metropolis expectation on
+                           thetaRef=t(thetaRef), # input the parameters used for reference for evaluating independent likelihood
+                           numbridges=20, # 20 bridges should be enough but more will give higher precision
+                           Yburnin=1000)
+
+```
+
+
+
